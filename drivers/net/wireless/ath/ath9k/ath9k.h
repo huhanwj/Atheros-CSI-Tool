@@ -23,11 +23,16 @@
 #include <linux/leds.h>
 #include <linux/completion.h>
 #include <linux/time.h>
-
+#include <linux/hw_random.h>
+#include <linux/kfifo.h>
 #include "common.h"
 #include "debug.h"
 #include "mci.h"
 #include "dfs.h"
+
+#ifdef  CONFIG_RT_WIFI
+#include "rt-wifi.h"
+#endif
 
 struct ath_node;
 struct ath_vif;
@@ -87,8 +92,12 @@ int ath_descdma_setup(struct ath_softc *sc, struct ath_descdma *dd,
 		(_l) &= ((_sz) - 1);		\
 	} while (0)
 
-#define ATH_RXBUF               512
-#define ATH_TXBUF               512
+/* rt-wifi: Increase buffer size */
+/*#define ATH_RXBUF               512
+#define ATH_TXBUF               512 */
+#define ATH_RXBUF               2048
+#define ATH_TXBUF               2048
+/* eom */
 #define ATH_TXBUF_RESERVE       5
 #define ATH_MAX_QDEPTH          (ATH_TXBUF / 4 - ATH_TXBUF_RESERVE)
 #define ATH_TXMAXTRY            13
@@ -235,7 +244,11 @@ struct ath_buf {
 	dma_addr_t bf_buf_addr;	/* physical addr of data buffer, for DMA */
 	struct ieee80211_tx_rate rates[4];
 	struct ath_buf_state bf_state;
+#ifdef CONFIG_RT_WIFI
+	u32 qnum;
+#endif
 };
+
 
 struct ath_atx_tid {
 	struct list_head list;
@@ -408,6 +421,12 @@ enum ath_offchannel_state {
 	ATH_OFFCHANNEL_ROC_START,
 	ATH_OFFCHANNEL_ROC_WAIT,
 	ATH_OFFCHANNEL_ROC_DONE,
+};
+
+enum ath_roc_complete_reason {
+	ATH_ROC_COMPLETE_EXPIRE,
+	ATH_ROC_COMPLETE_ABORT,
+	ATH_ROC_COMPLETE_CANCEL,
 };
 
 struct ath_offchannel {
@@ -637,6 +656,9 @@ struct ath9k_vif_iter_data {
 	int nstations; /* number of station vifs */
 	int nwds;      /* number of WDS vifs */
 	int nadhocs;   /* number of adhoc vifs */
+	int nocbs;     /* number of OCB vifs */
+	int nbcnvifs;  /* number of beaconing vifs */
+	struct ieee80211_vif *primary_beacon_vif;
 	struct ieee80211_vif *primary_sta;
 };
 
@@ -689,6 +711,7 @@ void ath9k_beacon_config(struct ath_softc *sc, struct ieee80211_vif *vif,
 			 u32 changed);
 void ath9k_beacon_assign_slot(struct ath_softc *sc, struct ieee80211_vif *vif);
 void ath9k_beacon_remove_slot(struct ath_softc *sc, struct ieee80211_vif *vif);
+void ath9k_beacon_ensure_primary_slot(struct ath_softc *sc);
 void ath9k_set_beacon(struct ath_softc *sc);
 bool ath9k_csa_is_finished(struct ath_softc *sc, struct ieee80211_vif *vif);
 void ath9k_csa_update(struct ath_softc *sc);
@@ -960,6 +983,7 @@ struct ath_softc {
 	struct survey_info *cur_survey;
 	struct survey_info survey[ATH9K_NUM_CHANNELS];
 
+	spinlock_t intr_lock;
 	struct tasklet_struct intr_tq;
 	struct tasklet_struct bcon_tasklet;
 	struct ath_hw *sc_ah;
@@ -982,6 +1006,7 @@ struct ath_softc {
 	struct ath_offchannel offchannel;
 	struct ath_chanctx *next_chan;
 	struct completion go_beacon;
+	struct timespec last_event_time;
 #endif
 
 	unsigned long driver_data;
@@ -1037,9 +1062,42 @@ struct ath_softc {
 	bool tx99_state;
 	s16 tx99_power;
 
+#ifdef CONFIG_RT_WIFI
+	int rt_wifi_enable;
+	struct ath_gen_timer *rt_wifi_timer;
+
+	struct kfifo rt_wifi_fifo;
+	struct list_head rt_wifi_q;
+	spinlock_t rt_wifi_q_lock;
+	spinlock_t rt_wifi_fifo_lock;
+	int rt_wifi_qcount;
+
+	int rt_wifi_join;
+
+	int rt_wifi_slot_num;
+
+	int rt_wifi_slot_len;		/* in micro sec */
+	u16 rt_wifi_superframe_size;	/* in terms of time slot */
+	int rt_wifi_asn;
+	u64 rt_wifi_cur_tsf;
+	struct rt_wifi_sched *rt_wifi_superframe;
+
+	/* for AP only */
+	u64 rt_wifi_bc_tsf;		/* broadcast tsf */
+	u64 rt_wifi_bc_asn;		/* broadcast asn */
+	u64 rt_wifi_virt_start_tsf;
+	u32 rt_wifi_beacon_bfaddr;
+	u32 rt_wifi_beacon_bc;
+#endif
+
 #ifdef CONFIG_ATH9K_WOW
 	u32 wow_intr_before_sleep;
 	bool force_wow;
+#endif
+
+#ifdef CONFIG_ATH9K_HWRNG
+	u32 rng_last;
+	struct task_struct *rng_task;
 #endif
 };
 
@@ -1063,6 +1121,13 @@ static inline int ath9k_tx99_send(struct ath_softc *sc,
 }
 #endif /* CONFIG_ATH9K_TX99 */
 
+/***************************/
+/* Random Number Generator */
+/***************************/
+#ifdef CONFIG_ATH9K_HWRNG
+void ath9k_rng_start(struct ath_softc *sc);
+void ath9k_rng_stop(struct ath_softc *sc);
+#else
 static inline void ath_read_cachesize(struct ath_common *common, int *csz)
 {
 	common->bus_ops->read_cachesize(common, csz);

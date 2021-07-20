@@ -121,6 +121,9 @@ static struct ath_buf *ath9k_beacon_generate(struct ieee80211_hw *hw,
 	struct ieee80211_tx_info *info;
 	struct ieee80211_mgmt *mgmt_hdr;
 	int cabq_depth;
+#ifdef CONFIG_RT_WIFI
+	unsigned char *tmp, *src;
+#endif
 
 	if (avp->av_bcbuf == NULL)
 		return NULL;
@@ -139,6 +142,33 @@ static struct ath_buf *ath9k_beacon_generate(struct ieee80211_hw *hw,
 	if (skb == NULL)
 		return NULL;
 
+#ifdef CONFIG_RT_WIFI
+	/* Append TDMA information to a beacon frame by vendor specific info. */
+	if (sc->rt_wifi_enable == 1) {
+		sc->rt_wifi_bc_tsf += RT_WIFI_BEACON_INTVAL;// Real time + interval
+		sc->rt_wifi_bc_asn +=
+			RT_WIFI_BEACON_INTVAL / sc->rt_wifi_slot_len;// time slot + interval (in time slot version)
+
+		tmp = skb_put(skb, RT_WIFI_BEACON_VEN_EXT_SIZE); // skb_put is used to push the tail pointer of skb,
+														 // leaving more room for new added information.
+														 // tmp is exactly the new added pointer to this 
+														 // new storage room
+		/* One memory unit is one byte = 16 bits */
+		tmp[0] = RT_WIFI_BEACON_TAG;    /* Tag number for Vendor Specific Info */
+		tmp[1] = 0x0F;	  /* Lengh of tag (exclude these two bytes) */
+
+		src = (unsigned char *)(&sc->rt_wifi_bc_asn);
+		memcpy((tmp+2), src, sizeof(int));			// int: 4bytes
+
+		src = (unsigned char *)(&sc->rt_wifi_bc_tsf);
+		memcpy((tmp+6), src, sizeof(u64));			// u64: 8bytes
+
+		*(tmp+14) = RT_WIFI_TIME_SLOT_LEN;
+
+		src = (unsigned char *)(&sc->rt_wifi_superframe_size);
+		memcpy((tmp+15), src, sizeof(u16));			// u16: 2bytes
+	}
+#endif
 	bf->bf_mpdu = skb;
 
 	mgmt_hdr = (struct ieee80211_mgmt *)skb->data;
@@ -182,8 +212,13 @@ static struct ath_buf *ath9k_beacon_generate(struct ieee80211_hw *hw,
 			ath_draintxq(sc, cabq);
 		}
 	}
-
-	ath9k_beacon_setup(sc, vif, bf, info->control.rates[0].idx);
+#ifdef CONFIG_RT_WIFI
+	#define RT_WIFI_BEACON_SPEED_24MBPS 4
+	/* May change beacon data rate here. */
+	ath9k_beacon_setup(sc, vif, bf, RT_WIFI_BEACON_SPEED_24MBPS);
+#else
+	ath9k_beacon_setup(sc, vif, bf, info->control.rates[0].idx); 	//See here there is no need for the new skb
+#endif
 
 	if (skb)
 		ath_tx_cabq(hw, vif, skb);
@@ -242,6 +277,68 @@ void ath9k_beacon_remove_slot(struct ath_softc *sc, struct ieee80211_vif *vif)
 	sc->nbcnvifs--;
 	list_add_tail(&bf->list, &sc->beacon.bbuf);
 
+	tasklet_enable(&sc->bcon_tasklet);
+}
+
+void ath9k_beacon_ensure_primary_slot(struct ath_softc *sc)
+{
+	struct ath_common *common = ath9k_hw_common(sc->sc_ah);
+	struct ieee80211_vif *vif;
+	struct ath_vif *avp;
+	s64 tsfadjust;
+	u32 offset;
+	int first_slot = ATH_BCBUF;
+	int slot;
+
+	tasklet_disable(&sc->bcon_tasklet);
+
+	/* Find first taken slot. */
+	for (slot = 0; slot < ATH_BCBUF; slot++) {
+		if (sc->beacon.bslot[slot]) {
+			first_slot = slot;
+			break;
+		}
+	}
+	if (first_slot == 0)
+		goto out;
+
+	/* Re-enumarate all slots, moving them forward. */
+	for (slot = 0; slot < ATH_BCBUF; slot++) {
+		if (slot + first_slot < ATH_BCBUF) {
+			vif = sc->beacon.bslot[slot + first_slot];
+			sc->beacon.bslot[slot] = vif;
+
+			if (vif) {
+				avp = (void *)vif->drv_priv;
+				avp->av_bslot = slot;
+			}
+		} else {
+			sc->beacon.bslot[slot] = NULL;
+		}
+	}
+
+	vif = sc->beacon.bslot[0];
+	if (WARN_ON(!vif))
+		goto out;
+
+	/* Get the tsf_adjust value for the new first slot. */
+	avp = (void *)vif->drv_priv;
+	tsfadjust = le64_to_cpu(avp->tsf_adjust);
+
+	ath_dbg(common, CONFIG,
+		"Adjusting global TSF after beacon slot reassignment: %lld\n",
+		(signed long long)tsfadjust);
+
+	/* Modify TSF as required and update the HW. */
+	avp->chanctx->tsf_val += tsfadjust;
+	if (sc->cur_chan == avp->chanctx) {
+		offset = ath9k_hw_get_tsf_offset(&avp->chanctx->tsf_ts, NULL);
+		ath9k_hw_settsf64(sc->sc_ah, avp->chanctx->tsf_val + offset);
+	}
+
+	/* The slots tsf_adjust will be updated by ath9k_beacon_config later. */
+
+out:
 	tasklet_enable(&sc->bcon_tasklet);
 }
 
@@ -433,6 +530,12 @@ void ath9k_beacon_tasklet(unsigned long data)
 		/* NB: cabq traffic should already be queued and primed */
 		ath9k_hw_puttxbuf(ah, sc->beacon.beaconq, bf->bf_daddr);
 
+#ifdef CONFIG_RT_WIFI
+		REG_SET_BIT(ah, AR_DIAG_SW, AR_DIAG_FORCE_CH_IDLE_HIGH);
+		REG_SET_BIT(ah, AR_DIAG_SW, AR_DIAG_IGNORE_VIRT_CS);
+		REG_SET_BIT(ah, AR_D_GBL_IFS_MISC, AR_D_GBL_IFS_MISC_IGNORE_BACKOFF); 
+#endif
+
 		if (!edma)
 			ath9k_hw_txstart(ah, sc->beacon.beaconq);
 	}
@@ -451,10 +554,12 @@ static void ath9k_beacon_init(struct ath_softc *sc, u32 nexttbtt,
 		ath9k_hw_reset_tsf(ah);
 	ath9k_beaconq_config(sc);
 	ath9k_hw_beaconinit(ah, nexttbtt, intval);
+	ah->imask |= ATH9K_INT_SWBA;
 	sc->beacon.bmisscnt = 0;
 	ath9k_hw_set_interrupts(ah);
 	ath9k_hw_enable_interrupts(ah);
 }
+
 
 /*
  * For multi-bss ap support beacons are either staggered evenly over N slots or
@@ -466,8 +571,18 @@ static void ath9k_beacon_config_ap(struct ath_softc *sc,
 {
 	struct ath_hw *ah = sc->sc_ah;
 
+
 	ath9k_cmn_beacon_config_ap(ah, conf, ATH_BCBUF);
 	ath9k_beacon_init(sc, conf->nexttbtt, conf->intval, false);
+#ifdef CONFIG_RT_WIFI
+	if(sc->rt_wifi_timer == NULL) {
+		RT_WIFI_DEBUG("No timer is allocated.\n");
+	} else {
+		RT_WIFI_DEBUG("AP timer starts.\n");
+		ath_rt_wifi_ap_start_timer(sc, conf->nexttbtt, conf->intval);
+		sc->rt_wifi_enable = 1;
+	}
+#endif
 }
 
 static void ath9k_beacon_config_sta(struct ath_hw *ah,
@@ -579,6 +694,7 @@ static void ath9k_cache_beacon_config(struct ath_softc *sc,
 	if (cur_conf->dtim_period == 0)
 		cur_conf->dtim_period = 1;
 
+	ath9k_set_tsfadjust(sc, cur_conf);
 }
 
 void ath9k_beacon_config(struct ath_softc *sc, struct ieee80211_vif *vif,

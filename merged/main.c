@@ -491,6 +491,7 @@ irqreturn_t ath_isr(int irq, void *dev)
 		ATH9K_INT_TX |			\
 		ATH9K_INT_BMISS |		\
 		ATH9K_INT_CST |			\
+		ATH9K_INT_GTT |			\
 		ATH9K_INT_TSFOOR |		\
 		ATH9K_INT_GENTIMER|		\
 		ATH9K_INT_MCI)
